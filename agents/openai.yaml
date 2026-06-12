@@ -1,0 +1,4 @@
+interface:
+  display_name: "Generate LBank KOL Promo V1"
+  short_description: "Generate LBank KOL promo copy."
+  default_prompt: "Generate local LBank KOL promo outputs from a confirmed affiliate table and activity copy."
