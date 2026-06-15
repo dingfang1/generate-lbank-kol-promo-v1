@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
 from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
@@ -559,6 +559,120 @@ def merge_images_by_row(target: dict[int, list[Any]], source: dict[int, list[Any
         target.setdefault(row_number, []).extend(images)
 
 
+def next_relationship_id(relationships_root: ET.Element) -> str:
+    max_id = 0
+    for relationship in relationships_root:
+        relationship_id = relationship.attrib.get("Id", "")
+        if relationship_id.startswith("rId") and relationship_id[3:].isdigit():
+            max_id = max(max_id, int(relationship_id[3:]))
+    return f"rId{max_id + 1}"
+
+
+def ensure_content_type_for_cell_images(content_types_xml: bytes, media_parts: list[str]) -> bytes:
+    content_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    ET.register_namespace("", content_ns)
+    root = ET.fromstring(content_types_xml)
+    default_tag = f"{{{content_ns}}}Default"
+    override_tag = f"{{{content_ns}}}Override"
+
+    defaults = {element.attrib.get("Extension", "").lower() for element in root.findall(default_tag)}
+    content_type_by_extension = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "bmp": "image/bmp",
+    }
+    for media_part in media_parts:
+        extension = Path(media_part).suffix.lower().lstrip(".")
+        if extension in content_type_by_extension and extension not in defaults:
+            root.append(ET.Element(default_tag, {"Extension": extension, "ContentType": content_type_by_extension[extension]}))
+            defaults.add(extension)
+
+    has_cellimage_override = any(
+        element.attrib.get("PartName") == "/xl/cellimages.xml"
+        for element in root.findall(override_tag)
+    )
+    if not has_cellimage_override:
+        root.append(
+            ET.Element(
+                override_tag,
+                {
+                    "PartName": "/xl/cellimages.xml",
+                    "ContentType": "application/vnd.wps-officedocument.cellimage+xml",
+                },
+            )
+        )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def ensure_workbook_cellimage_relationship(workbook_rels_xml: bytes) -> bytes:
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    ET.register_namespace("", rel_ns)
+    root = ET.fromstring(workbook_rels_xml)
+    relationship_tag = f"{{{rel_ns}}}Relationship"
+    cellimage_type = "http://www.wps.cn/officeDocument/2020/cellImage"
+    has_cellimage_rel = any(
+        relationship.attrib.get("Type") == cellimage_type
+        for relationship in root.findall(relationship_tag)
+    )
+    if not has_cellimage_rel:
+        root.append(
+            ET.Element(
+                relationship_tag,
+                {
+                    "Id": next_relationship_id(root),
+                    "Type": cellimage_type,
+                    "Target": "cellimages.xml",
+                },
+            )
+        )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def restore_wps_cell_images(input_table: Path, output_table: Path) -> None:
+    cellimages_part = "xl/cellimages.xml"
+    cellimages_rels_part = xlsx_rels_part(cellimages_part)
+    try:
+        with ZipFile(input_table) as source_archive:
+            if cellimages_part not in source_archive.namelist() or cellimages_rels_part not in source_archive.namelist():
+                return
+            source_relationships = parse_relationship_targets(source_archive.read(cellimages_rels_part))
+            media_parts = [
+                xlsx_part_join(cellimages_part, target)
+                for target in source_relationships.values()
+                if target and target.upper() != "NULL"
+            ]
+            parts_to_copy = [cellimages_part, cellimages_rels_part, *media_parts]
+            source_parts = {
+                part: source_archive.read(part)
+                for part in parts_to_copy
+                if part in source_archive.namelist()
+            }
+        if cellimages_part not in source_parts or cellimages_rels_part not in source_parts:
+            return
+
+        with ZipFile(output_table) as output_archive:
+            output_parts = {info.filename: output_archive.read(info.filename) for info in output_archive.infolist()}
+
+        output_parts.update(source_parts)
+        output_parts["[Content_Types].xml"] = ensure_content_type_for_cell_images(
+            output_parts["[Content_Types].xml"],
+            media_parts,
+        )
+        output_parts["xl/_rels/workbook.xml.rels"] = ensure_workbook_cellimage_relationship(
+            output_parts["xl/_rels/workbook.xml.rels"]
+        )
+
+        temp_output = output_table.with_suffix(".tmp.xlsx")
+        with ZipFile(temp_output, "w", compression=ZIP_DEFLATED) as archive:
+            for name, data in output_parts.items():
+                archive.writestr(name, data)
+        temp_output.replace(output_table)
+    except (KeyError, OSError, ET.ParseError):
+        return
+
+
 def template_activity_image_map(wb: Workbook, records: list[dict[str, str]], sheet_name: str = LEGACY_ACTIVITY_SHEET) -> dict[str, list[Any]]:
     ws = wb[sheet_name]
     headers = [normalize_header(cell.value) for cell in ws[1]]
@@ -605,20 +719,6 @@ def template_activity_images_by_row(wb: Workbook, sheet_name: str = LEGACY_ACTIV
     if workbook_path:
         merge_images_by_row(images_by_row, worksheet_dispimg_images_by_row(workbook_path, sheet_name, poster_column))
     return images_by_row
-
-
-def replace_activity_sheet_image_cells_with_asset_paths(wb: Workbook, sheet_name: str, asset_paths_by_row: dict[int, list[str]]) -> None:
-    if sheet_name not in wb.sheetnames:
-        return
-    ws = wb[sheet_name]
-    headers = [normalize_header(cell.value) for cell in ws[1]]
-    if "配图" not in headers:
-        return
-    poster_column = headers.index("配图") + 1
-    for row_number, asset_paths in asset_paths_by_row.items():
-        if row_number <= 1 or row_number > ws.max_row or not asset_paths:
-            continue
-        ws.cell(row=row_number, column=poster_column).value = " | ".join(asset_paths)
 
 
 def save_activity_image_assets(activity_index: int, images: list[Any], assets_dir: Path, asset_key: str = "") -> list[str]:
@@ -779,7 +879,6 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
                 asset_key=asset_key,
             )
             activity_asset_paths.extend(saved_assets_by_row[activity_row_number])
-        replace_activity_sheet_image_cells_with_asset_paths(wb, source.sheet_name, saved_assets_by_row)
 
         for record in kol_records:
             base = {
@@ -864,6 +963,7 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
     filled_template = run_dir / "filled_template.xlsx"
     wb.save(filled_template)
     wb.close()
+    restore_wps_cell_images(input_table, filled_template)
 
     write_generated_markdown(debug_dir / "generated_messages.md", generated_rows)
     write_csv_rows(debug_dir / "generated_messages.csv", OUTPUT_FIELDS, generated_rows + skipped_rows)

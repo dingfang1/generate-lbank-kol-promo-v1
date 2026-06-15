@@ -618,10 +618,19 @@ Step 2: Register the event
             self.assertEqual(asset_path, "assets/activity_1_row_2_image_1.png")
             self.assertEqual(fallback_asset_path, "assets/activity_1_row_2_image_1.png")
             self.assertTrue((output_root / "test1" / asset_path).exists())
-            source_ws = wb["活动1"]
-            self.assertEqual(source_ws["E2"].value, "assets/activity_1_row_2_image_1.png")
-            self.assertNotIn("DISPIMG", source_ws["E2"].value)
             wb.close()
+
+            output_path = output_root / "test1" / "filled_template.xlsx"
+            source_wb = load_workbook(output_path, data_only=False)
+            source_ws = source_wb["活动1"]
+            self.assertIn("DISPIMG", source_ws["E2"].value)
+            source_wb.close()
+            with ZipFile(output_path) as archive:
+                names = archive.namelist()
+                self.assertIn("xl/cellimages.xml", names)
+                self.assertIn("xl/_rels/cellimages.xml.rels", names)
+                workbook_rels = archive.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+                self.assertIn("http://www.wps.cn/officeDocument/2020/cellImage", workbook_rels)
 
 
 if __name__ == "__main__":
