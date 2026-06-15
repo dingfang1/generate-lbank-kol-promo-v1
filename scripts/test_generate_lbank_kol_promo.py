@@ -618,6 +618,9 @@ Step 2: Register the event
             self.assertEqual(asset_path, "assets/activity_1_row_2_image_1.png")
             self.assertEqual(fallback_asset_path, "assets/activity_1_row_2_image_1.png")
             self.assertTrue((output_root / "test1" / asset_path).exists())
+            source_ws = wb["活动1"]
+            self.assertEqual(source_ws["E2"].value, "assets/activity_1_row_2_image_1.png")
+            self.assertNotIn("DISPIMG", source_ws["E2"].value)
             wb.close()
 
 

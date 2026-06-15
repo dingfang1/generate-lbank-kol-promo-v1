@@ -74,6 +74,7 @@ If the user pasted activity copy directly in chat, either pass it with `--activi
   - Append `?icode=...` or `&icode=...` when missing.
 - Remove all whitespace inside `代理邀请码` before generating links; for example, `AB C003` becomes `ABC003`.
 - In preferred workbook mode, images on `配图` cells in `活动N` sheets are saved once under `assets/` per activity-language row. This supports both normal embedded pictures and WPS/Excel `DISPIMG(...)` cell-image formulas. The matching `活动宣发素材图` cells contain the relative asset path, avoiding repeated image embedding and oversized Excel files. Legacy `本期活动内容` images are handled the same way.
+- In `filled_template.xlsx`, source activity-sheet `配图` cells that used image formulas are also replaced with their exported `assets/...` paths to avoid `#NAME?` display noise.
 - Replace code placeholders such as `xxxx`, `{invite_code}`, and `{邀请码}`.
 - Replace registration link placeholders such as `{registration_link}`, `{ref_link}`, and `{注册链接}`.
 - Replace sample invite codes found in `/ref/...` and `icode=...` examples throughout the copy.

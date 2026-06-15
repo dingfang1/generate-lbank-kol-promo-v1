@@ -607,6 +607,20 @@ def template_activity_images_by_row(wb: Workbook, sheet_name: str = LEGACY_ACTIV
     return images_by_row
 
 
+def replace_activity_sheet_image_cells_with_asset_paths(wb: Workbook, sheet_name: str, asset_paths_by_row: dict[int, list[str]]) -> None:
+    if sheet_name not in wb.sheetnames:
+        return
+    ws = wb[sheet_name]
+    headers = [normalize_header(cell.value) for cell in ws[1]]
+    if "配图" not in headers:
+        return
+    poster_column = headers.index("配图") + 1
+    for row_number, asset_paths in asset_paths_by_row.items():
+        if row_number <= 1 or row_number > ws.max_row or not asset_paths:
+            continue
+        ws.cell(row=row_number, column=poster_column).value = " | ".join(asset_paths)
+
+
 def save_activity_image_assets(activity_index: int, images: list[Any], assets_dir: Path, asset_key: str = "") -> list[str]:
     if not images:
         return []
@@ -753,6 +767,19 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
     for activity_index, source in enumerate(activity_sources, start=1):
         sheet_rows: list[dict[str, Any]] = []
         saved_assets_by_row: dict[int, list[str]] = {}
+        for activity in source.records:
+            activity_row_number = int(activity.get(INTERNAL_ROW_NUMBER_FIELD, "0") or 0)
+            if activity_row_number in saved_assets_by_row:
+                continue
+            asset_key = f"row_{activity_row_number}" if source.language_pack else ""
+            saved_assets_by_row[activity_row_number] = save_activity_image_assets(
+                activity_index,
+                source.images_by_row.get(activity_row_number, []),
+                assets_dir,
+                asset_key=asset_key,
+            )
+            activity_asset_paths.extend(saved_assets_by_row[activity_row_number])
+        replace_activity_sheet_image_cells_with_asset_paths(wb, source.sheet_name, saved_assets_by_row)
 
         for record in kol_records:
             base = {
@@ -775,15 +802,6 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
             if not reason and not any(normalize_cell(activity.get(field, "")) for field in ("标题", "正文", "链接")):
                 reason = "缺少活动文案"
             activity_row_number = int(activity.get(INTERNAL_ROW_NUMBER_FIELD, "0") or 0)
-            if activity_row_number not in saved_assets_by_row:
-                asset_key = f"row_{activity_row_number}" if source.language_pack else ""
-                saved_assets_by_row[activity_row_number] = save_activity_image_assets(
-                    activity_index,
-                    source.images_by_row.get(activity_row_number, []),
-                    assets_dir,
-                    asset_key=asset_key,
-                )
-                activity_asset_paths.extend(saved_assets_by_row[activity_row_number])
             asset_paths = saved_assets_by_row.get(activity_row_number, [])
 
             remark = f"语言 {record.get('语言', '')} 未提供，已使用 {fallback_language} 英文兜底" if fallback_language else ""

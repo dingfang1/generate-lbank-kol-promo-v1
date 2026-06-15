@@ -29,7 +29,7 @@ The current business rule is single-activity tracking: use one activity sheet pe
 | `标题` | Prepended to generated promo copy. |
 | `正文` | Main activity copy. Event links inside it are rewritten with `icode`. |
 | `链接` | Canonical Step 2 activity link. It is rewritten with `icode`. |
-| `配图` | Text values are copied to `活动宣发素材图`. Normal embedded pictures and WPS/Excel `DISPIMG(...)` cell-image formulas on this cell are saved once under `assets/` per activity-language row, and the matching output cells contain the relative asset path. |
+| `配图` | Text values are copied to `活动宣发素材图`. Normal embedded pictures and WPS/Excel `DISPIMG(...)` cell-image formulas on this cell are saved once under `assets/` per activity-language row, and the matching output cells contain the relative asset path. In the output copy, image formulas in this source sheet are also replaced with the exported `assets/...` path. |
 
 ### `本期活动内容` legacy sheet
 
