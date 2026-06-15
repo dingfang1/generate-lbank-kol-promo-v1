@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import posixpath
 import re
 import shutil
 import sys
@@ -15,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
@@ -23,8 +26,12 @@ from openpyxl.styles import Alignment, Font
 
 DEFAULT_OUTPUT_ROOT = Path("output")
 CANONICAL_HEADERS = ["代理UID", "代理邀请码", "语言", "地区", "使用域名", "BD确认状态", "本活动是否已发送", "TG群名", "TG链接"]
-OUTPUT_FIELDS = CANONICAL_HEADERS + ["注册链接", "活动链接", "生成宣发文案", "生成状态", "跳过原因"]
+OUTPUT_FIELDS = CANONICAL_HEADERS + ["注册链接", "活动链接", "生成宣发文案", "生成状态", "跳过原因", "备注"]
 TEMPLATE_SHEETS = ("KOL状态 最新状态", "本期活动内容", "宣发及回链内容")
+KOL_TEMPLATE_SHEET = "KOL状态 最新状态"
+LEGACY_ACTIVITY_SHEET = "本期活动内容"
+OUTPUT_TEMPLATE_SHEET = "宣发及回链内容"
+ACTIVITY_SHEET_RE = re.compile(r"^活动(\d+)$")
 TEMPLATE_OUTPUT_FIELDS = [
     "代理UID",
     "代理邀请码",
@@ -38,6 +45,7 @@ TEMPLATE_OUTPUT_FIELDS = [
     "活动宣发素材图",
     "生成状态",
     "跳过原因",
+    "备注",
     "生成时间",
     "回链",
     "截图",
@@ -108,6 +116,22 @@ class PersonalizedText:
     message: str
     registration_link: str
     activity_links: list[str]
+
+
+@dataclass(frozen=True)
+class TemplateActivitySource:
+    sheet_name: str
+    records: list[dict[str, str]]
+    images_by_row: dict[int, list[Any]]
+    language_pack: bool
+
+
+@dataclass(frozen=True)
+class CellImageAsset:
+    data: bytes
+    extension: str
+    width: int = OUTPUT_IMAGE_MAX_WIDTH
+    height: int = OUTPUT_IMAGE_MAX_HEIGHT
 
 
 def normalize_header(value: object) -> str:
@@ -276,9 +300,20 @@ def is_template_workbook(path: Path) -> bool:
         return False
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        return all(sheet_name in wb.sheetnames for sheet_name in TEMPLATE_SHEETS)
+        has_legacy_template = all(sheet_name in wb.sheetnames for sheet_name in TEMPLATE_SHEETS)
+        has_activity_sheets = KOL_TEMPLATE_SHEET in wb.sheetnames and bool(activity_sheet_names(wb))
+        return has_legacy_template or has_activity_sheets
     finally:
         wb.close()
+
+
+def activity_sheet_names(wb: Workbook) -> list[str]:
+    matches = []
+    for sheet_name in wb.sheetnames:
+        match = ACTIVITY_SHEET_RE.fullmatch(sheet_name)
+        if match:
+            matches.append((int(match.group(1)), sheet_name))
+    return [sheet_name for _index, sheet_name in sorted(matches)]
 
 
 def read_sheet_records(wb: Workbook, sheet_name: str) -> list[dict[str, str]]:
@@ -309,26 +344,6 @@ def link_with_icode(link: str, invite_code: str) -> str:
     return rewrite_lbank_url(text, normalize_invite_code(invite_code), "")
 
 
-def template_step_lines(language: str, event_link: str) -> list[str]:
-    key = normalize_language_key(language)
-    if key in {"en", "eng", "english"}:
-        return [
-            "Step 1: Sign up with invite code {invite_code}",
-            "-> {registration_link}",
-            "Step 2: Join the event",
-            f"-> {event_link}",
-        ]
-    if key in {"繁中", "zh-hant", "zh-tw", "tw", "hk"}:
-        return [
-            "👉步驟1: 邀請碼註冊鏈接 →{registration_link}",
-            f"👉步驟2: 點擊活動鏈接 → {event_link}",
-        ]
-    return [
-        "👉步骤1: 邀请码注册链接 →{registration_link}",
-        f"👉步骤2: 点击活动链接 → {event_link}",
-    ]
-
-
 def compose_template_activity_copy(activity: dict[str, str], language: str) -> str:
     title = normalize_cell(activity.get("标题", ""))
     body = normalize_cell(activity.get("正文", ""))
@@ -336,8 +351,6 @@ def compose_template_activity_copy(activity: dict[str, str], language: str) -> s
     parts = [part for part in [title, body] if part]
     if event_link and event_link not in body:
         parts.append(event_link)
-    if event_link:
-        parts.append("\n".join(template_step_lines(language, event_link)))
     return "\n\n".join(parts).strip()
 
 
@@ -360,6 +373,9 @@ def image_anchor_start(image: Any) -> tuple[int, int] | None:
 
 
 def image_bytes(image: Any) -> bytes:
+    data = getattr(image, "data", None)
+    if isinstance(data, bytes):
+        return data
     ref = getattr(image, "ref", None)
     if isinstance(ref, (str, Path)):
         return Path(ref).read_bytes()
@@ -381,6 +397,9 @@ def image_bytes(image: Any) -> bytes:
 
 
 def image_extension(image: Any) -> str:
+    extension = normalize_cell(getattr(image, "extension", "")).lower()
+    if extension in {".png", ".jpg", ".jpeg", ".gif", ".bmp"}:
+        return extension
     image_path = normalize_cell(getattr(image, "path", ""))
     suffix = Path(image_path).suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp"}:
@@ -409,8 +428,139 @@ def scale_image_to_fit(image: OpenpyxlImage, max_width: int, max_height: int) ->
     image.height = int(image.height * scale)
 
 
-def template_activity_image_map(wb: Workbook, records: list[dict[str, str]]) -> dict[str, list[Any]]:
-    ws = wb["本期活动内容"]
+def xlsx_part_join(base_part: str, target: str) -> str:
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join(posixpath.dirname(base_part), target))
+
+
+def xlsx_rels_part(part_name: str) -> str:
+    directory = posixpath.dirname(part_name)
+    filename = posixpath.basename(part_name)
+    return posixpath.join(directory, "_rels", f"{filename}.rels")
+
+
+def parse_relationship_targets(xml_data: bytes) -> dict[str, str]:
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    root = ET.fromstring(xml_data)
+    return {
+        relationship.attrib.get("Id", ""): relationship.attrib.get("Target", "")
+        for relationship in root.findall(f"{rel_ns}Relationship")
+        if relationship.attrib.get("Id")
+    }
+
+
+def workbook_sheet_parts(workbook_path: Path) -> dict[str, str]:
+    main_ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rel_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    try:
+        with ZipFile(workbook_path) as archive:
+            workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+            relationships = parse_relationship_targets(archive.read("xl/_rels/workbook.xml.rels"))
+    except (KeyError, OSError, ET.ParseError):
+        return {}
+
+    parts = {}
+    for sheet in workbook_root.findall("main:sheets/main:sheet", main_ns):
+        sheet_name = sheet.attrib.get("name", "")
+        relationship_id = sheet.attrib.get(rel_attr, "")
+        target = relationships.get(relationship_id, "")
+        if sheet_name and target:
+            parts[sheet_name] = xlsx_part_join("xl/workbook.xml", target)
+    return parts
+
+
+def read_wps_cell_image_assets(workbook_path: Path) -> dict[str, CellImageAsset]:
+    drawing_ns = {
+        "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+    embed_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+    try:
+        with ZipFile(workbook_path) as archive:
+            cellimages_part = "xl/cellimages.xml"
+            relationships = parse_relationship_targets(archive.read(xlsx_rels_part(cellimages_part)))
+            root = ET.fromstring(archive.read(cellimages_part))
+            assets = {}
+            for pic in root.findall(".//xdr:pic", drawing_ns):
+                properties = pic.find(".//xdr:cNvPr", drawing_ns)
+                blip = pic.find(".//a:blip", drawing_ns)
+                if properties is None or blip is None:
+                    continue
+                image_id = properties.attrib.get("name", "")
+                relationship_id = blip.attrib.get(embed_attr, "")
+                target = relationships.get(relationship_id, "")
+                if not image_id or not target or target.upper() == "NULL":
+                    continue
+                media_part = xlsx_part_join(cellimages_part, target)
+                extension = Path(media_part).suffix.lower() or ".png"
+                assets[image_id] = CellImageAsset(
+                    data=archive.read(media_part),
+                    extension=extension,
+                    width=OUTPUT_IMAGE_MAX_WIDTH,
+                    height=OUTPUT_IMAGE_MAX_HEIGHT,
+                )
+            return assets
+    except (KeyError, OSError, ET.ParseError):
+        return {}
+
+
+def worksheet_dispimg_images_by_row(workbook_path: Path, sheet_name: str, poster_column: int | None) -> dict[int, list[CellImageAsset]]:
+    sheet_part = workbook_sheet_parts(workbook_path).get(sheet_name)
+    if not sheet_part:
+        return {}
+    cell_images = read_wps_cell_image_assets(workbook_path)
+    if not cell_images:
+        return {}
+
+    main_ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    images_by_row: dict[int, list[CellImageAsset]] = {}
+    try:
+        with ZipFile(workbook_path) as archive:
+            root = ET.fromstring(archive.read(sheet_part))
+    except (KeyError, OSError, ET.ParseError):
+        return {}
+
+    for cell in root.findall(".//main:c", main_ns):
+        coordinate = cell.attrib.get("r", "")
+        match = re.fullmatch(r"([A-Z]+)(\d+)", coordinate)
+        if not match:
+            continue
+        column_letters, row_text = match.groups()
+        column_number = 0
+        for letter in column_letters:
+            column_number = column_number * 26 + ord(letter) - ord("A") + 1
+        if poster_column and column_number != poster_column:
+            continue
+
+        formula = cell.find("main:f", main_ns)
+        value = cell.find("main:v", main_ns)
+        formula_text = "\n".join(
+            part
+            for part in [
+                formula.text if formula is not None else "",
+                value.text if value is not None else "",
+            ]
+            if part
+        )
+        seen_image_ids = set()
+        for image_id in re.findall(r"DISPIMG\(\s*[\"']([^\"']+)[\"']", formula_text, flags=re.IGNORECASE):
+            if image_id in seen_image_ids:
+                continue
+            seen_image_ids.add(image_id)
+            image = cell_images.get(image_id)
+            if image:
+                images_by_row.setdefault(int(row_text), []).append(image)
+    return images_by_row
+
+
+def merge_images_by_row(target: dict[int, list[Any]], source: dict[int, list[Any]]) -> None:
+    for row_number, images in source.items():
+        target.setdefault(row_number, []).extend(images)
+
+
+def template_activity_image_map(wb: Workbook, records: list[dict[str, str]], sheet_name: str = LEGACY_ACTIVITY_SHEET) -> dict[str, list[Any]]:
+    ws = wb[sheet_name]
     headers = [normalize_header(cell.value) for cell in ws[1]]
     poster_column = headers.index("配图") + 1 if "配图" in headers else None
     images_by_row: dict[int, list[Any]] = {}
@@ -438,8 +588,8 @@ def template_activity_image_map(wb: Workbook, records: list[dict[str, str]]) -> 
     return mapping
 
 
-def template_activity_images_by_row(wb: Workbook) -> dict[int, list[Any]]:
-    ws = wb["本期活动内容"]
+def template_activity_images_by_row(wb: Workbook, sheet_name: str = LEGACY_ACTIVITY_SHEET, workbook_path: Path | None = None) -> dict[int, list[Any]]:
+    ws = wb[sheet_name]
     headers = [normalize_header(cell.value) for cell in ws[1]]
     poster_column = headers.index("配图") + 1 if "配图" in headers else None
     images_by_row: dict[int, list[Any]] = {}
@@ -452,19 +602,67 @@ def template_activity_images_by_row(wb: Workbook) -> dict[int, list[Any]]:
         if poster_column and column_number != poster_column:
             continue
         images_by_row.setdefault(row_number, []).append(image)
+    if workbook_path:
+        merge_images_by_row(images_by_row, worksheet_dispimg_images_by_row(workbook_path, sheet_name, poster_column))
     return images_by_row
 
 
-def save_activity_image_assets(activity_index: int, images: list[Any], assets_dir: Path) -> list[str]:
+def save_activity_image_assets(activity_index: int, images: list[Any], assets_dir: Path, asset_key: str = "") -> list[str]:
     if not images:
         return []
     assets_dir.mkdir(parents=True, exist_ok=True)
     paths = []
+    clean_key = re.sub(r"[^A-Za-z0-9_-]+", "_", normalize_cell(asset_key)).strip("_")
+    name_key = f"_{clean_key}" if clean_key else ""
     for image_index, image in enumerate(images, start=1):
-        target = assets_dir / f"activity_{activity_index}_image_{image_index}{image_extension(image)}"
+        target = assets_dir / f"activity_{activity_index}{name_key}_image_{image_index}{image_extension(image)}"
         target.write_bytes(image_bytes(image))
         paths.append(f"assets/{target.name}")
     return paths
+
+
+def load_template_activity_sources(wb: Workbook, workbook_path: Path | None = None) -> list[TemplateActivitySource]:
+    activity_sheets = activity_sheet_names(wb)
+    if activity_sheets:
+        return [
+            TemplateActivitySource(
+                sheet_name=sheet_name,
+                records=read_sheet_records(wb, sheet_name),
+                images_by_row=template_activity_images_by_row(wb, sheet_name, workbook_path),
+                language_pack=True,
+            )
+            for sheet_name in activity_sheets
+        ]
+
+    records = read_sheet_records(wb, LEGACY_ACTIVITY_SHEET) if LEGACY_ACTIVITY_SHEET in wb.sheetnames else []
+    images_by_row = template_activity_images_by_row(wb, LEGACY_ACTIVITY_SHEET, workbook_path) if LEGACY_ACTIVITY_SHEET in wb.sheetnames else {}
+    return [
+        TemplateActivitySource(
+            sheet_name=LEGACY_ACTIVITY_SHEET,
+            records=[record],
+            images_by_row=images_by_row,
+            language_pack=False,
+        )
+        for record in (records or [{}])
+    ]
+
+
+def select_activity_record(
+    source: TemplateActivitySource,
+    kol_language: str,
+) -> tuple[dict[str, str], str | None, str | None]:
+    if not source.language_pack:
+        return source.records[0], None, None
+
+    mapping = template_activity_map(source.records)
+    language_key = normalize_language_key(kol_language)
+    if language_key in mapping:
+        return mapping[language_key], None, None
+    if "en" in mapping:
+        return mapping["en"], "EN", None
+    if "default" in mapping:
+        return mapping["default"], "default", None
+    return {}, None, "缺少对应语言活动文案"
 
 
 def remove_template_output_sheets(wb: Workbook) -> None:
@@ -498,6 +696,7 @@ def ensure_template_output_sheet(ws) -> None:
         "活动宣发素材图": 32,
         "生成状态": 14,
         "跳过原因": 24,
+        "备注": 34,
         "生成时间": 22,
         "回链": 42,
         "截图": 32,
@@ -533,10 +732,8 @@ def write_template_output_sheet(wb: Workbook, rows: list[dict[str, Any]], sheet_
 
 def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPUT_ROOT) -> dict[str, object]:
     wb = load_workbook(input_table)
-    kol_records = read_sheet_records(wb, "KOL状态 最新状态")
-    activity_records = read_sheet_records(wb, "本期活动内容")
-    activities = activity_records or [{}]
-    activity_images_by_row = template_activity_images_by_row(wb)
+    kol_records = read_sheet_records(wb, KOL_TEMPLATE_SHEET)
+    activity_sources = load_template_activity_sources(wb, input_table)
 
     output_root.mkdir(parents=True, exist_ok=True)
     run_dir = next_run_dir(output_root)
@@ -548,19 +745,14 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
     generated_rows: list[dict[str, str]] = []
     skipped_rows: list[dict[str, str]] = []
     activity_asset_paths: list[str] = []
+    fallback_rows: list[dict[str, str]] = []
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     remove_template_output_sheets(wb)
-    activity_count = len(activities)
-    for activity_index, activity in enumerate(activities, start=1):
+    activity_count = len(activity_sources)
+    for activity_index, source in enumerate(activity_sources, start=1):
         sheet_rows: list[dict[str, Any]] = []
-        activity_row_number = int(activity.get(INTERNAL_ROW_NUMBER_FIELD, "0") or 0)
-        asset_paths = save_activity_image_assets(
-            activity_index,
-            activity_images_by_row.get(activity_row_number, []),
-            assets_dir,
-        )
-        activity_asset_paths.extend(asset_paths)
+        saved_assets_by_row: dict[int, list[str]] = {}
 
         for record in kol_records:
             base = {
@@ -577,12 +769,28 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
                 "付款人": "",
             }
             reason = review_skip_reason(record)
+            activity, fallback_language, missing_activity_reason = select_activity_record(source, record.get("语言", ""))
+            if not reason and missing_activity_reason:
+                reason = missing_activity_reason
             if not reason and not any(normalize_cell(activity.get(field, "")) for field in ("标题", "正文", "链接")):
                 reason = "缺少活动文案"
+            activity_row_number = int(activity.get(INTERNAL_ROW_NUMBER_FIELD, "0") or 0)
+            if activity_row_number not in saved_assets_by_row:
+                asset_key = f"row_{activity_row_number}" if source.language_pack else ""
+                saved_assets_by_row[activity_row_number] = save_activity_image_assets(
+                    activity_index,
+                    source.images_by_row.get(activity_row_number, []),
+                    assets_dir,
+                    asset_key=asset_key,
+                )
+                activity_asset_paths.extend(saved_assets_by_row[activity_row_number])
+            asset_paths = saved_assets_by_row.get(activity_row_number, [])
+
+            remark = f"语言 {record.get('语言', '')} 未提供，已使用 {fallback_language} 英文兜底" if fallback_language else ""
 
             if reason:
-                row = {**base, "注册链接": "", "活动链接": "", "活动宣发内容": "", "活动宣发素材图": "", "生成状态": "已跳过", "跳过原因": reason, "生成时间": generated_at}
-                skipped_rows.append({**row, "BD确认状态": record.get("投放复核状态", ""), "本活动是否已发送": "", "TG群名": "", "TG链接": "", "生成宣发文案": ""})
+                row = {**base, "注册链接": "", "活动链接": "", "活动宣发内容": "", "活动宣发素材图": "", "生成状态": "已跳过", "跳过原因": reason, "备注": remark, "生成时间": generated_at}
+                skipped_rows.append({**row, "BD确认状态": record.get("投放复核状态", ""), "本活动是否已发送": "", "TG群名": "", "TG链接": "", "生成宣发文案": "", "备注": row["备注"]})
                 sheet_rows.append(row)
                 continue
 
@@ -599,6 +807,7 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
                 "活动宣发素材图": asset_text,
                 "生成状态": "已生成",
                 "跳过原因": "",
+                "备注": remark,
                 "生成时间": generated_at,
             }
             generated_rows.append(
@@ -617,8 +826,19 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
                     "生成宣发文案": row["活动宣发内容"],
                     "生成状态": "已生成",
                     "跳过原因": "",
+                    "备注": row["备注"],
                 }
             )
+            if fallback_language:
+                fallback_rows.append(
+                    {
+                        "activity": source.sheet_name,
+                        "代理UID": row["代理UID"],
+                        "代理邀请码": row["代理邀请码"],
+                        "原语言": row["语言"],
+                        "兜底语言": fallback_language,
+                    }
+                )
             sheet_rows.append(row)
 
         write_template_output_sheet(wb, sheet_rows, template_output_sheet_name(activity_index, activity_count))
@@ -636,11 +856,13 @@ def run_template_generation(input_table: Path, output_root: Path = DEFAULT_OUTPU
     summary = {
         "run_dir": str(run_dir),
         "input_table": str(input_table),
-        "mode": "three_sheet_template",
-        "activity_text": "本期活动内容",
+        "mode": "activity_sheet_template" if any(source.language_pack for source in activity_sources) else "three_sheet_template",
+        "activity_text": ", ".join(source.sheet_name for source in activity_sources),
         "activity_count": activity_count,
         "generated_count": len(generated_rows),
         "skipped_count": len(skipped_rows),
+        "fallback_count": len(fallback_rows),
+        "fallback_rows": fallback_rows,
         "output_files": [
             "filled_template.xlsx",
             *activity_asset_paths,
@@ -790,6 +1012,7 @@ def write_xlsx_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]
         "生成宣发文案": 80,
         "生成状态": 12,
         "跳过原因": 18,
+        "备注": 28,
     }
     for index, field in enumerate(fieldnames, start=1):
         ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width_by_field.get(field, 18)
@@ -831,14 +1054,14 @@ def run_generation(
     for record in records:
         reason = skip_reason(record)
         if reason:
-            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": reason}
+            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": reason, "备注": ""}
             skipped_rows.append(row)
             output_rows.append(row)
             continue
 
         text = load_activity_text(record.get("语言", ""))
         if not text:
-            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": "缺少对应语言活动文案"}
+            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": "缺少对应语言活动文案", "备注": ""}
             skipped_rows.append(row)
             output_rows.append(row)
             continue
@@ -846,7 +1069,7 @@ def run_generation(
         try:
             personalized = personalize_activity_text(text, record["代理邀请码"], record["使用域名"])
         except ValueError as exc:
-            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": str(exc)}
+            row = {**record, "注册链接": "", "活动链接": "", "生成宣发文案": "", "生成状态": "已跳过", "跳过原因": str(exc), "备注": ""}
             skipped_rows.append(row)
             output_rows.append(row)
             continue
@@ -858,6 +1081,7 @@ def run_generation(
             "生成宣发文案": personalized.message,
             "生成状态": "已生成",
             "跳过原因": "",
+            "备注": "",
         }
         generated_rows.append(row)
         output_rows.append(row)

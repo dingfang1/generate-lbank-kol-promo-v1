@@ -4,6 +4,8 @@ import json
 import sys
 import tempfile
 import unittest
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -13,7 +15,7 @@ from PIL import Image as PILImage
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from generate_lbank_kol_promo import DEFAULT_OUTPUT_ROOT, build_registration_link, next_run_dir, personalize_activity_text, run_generation
+from generate_lbank_kol_promo import DEFAULT_OUTPUT_ROOT, build_registration_link, is_template_workbook, next_run_dir, personalize_activity_text, run_generation
 
 
 HEADERS = [
@@ -57,6 +59,83 @@ def write_test_png(path: Path, size: tuple[int, int] = (1200, 400)) -> None:
     image.save(path)
 
 
+def add_wps_cell_image(path: Path, image_path: Path, image_id: str = "ID_TEST_IMAGE") -> None:
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    sheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ET.register_namespace("", rel_ns)
+    ET.register_namespace("", sheet_ns)
+    with ZipFile(path, "r") as source:
+        entries = {info.filename: source.read(info.filename) for info in source.infolist()}
+
+    workbook_rels_part = "xl/_rels/workbook.xml.rels"
+    rels_root = ET.fromstring(entries[workbook_rels_part])
+    existing_ids = [
+        int(relationship.attrib["Id"][3:])
+        for relationship in rels_root
+        if relationship.attrib.get("Id", "").startswith("rId") and relationship.attrib["Id"][3:].isdigit()
+    ]
+    next_id = max(existing_ids or [0]) + 1
+    rels_root.append(
+        ET.Element(
+            f"{{{rel_ns}}}Relationship",
+            {
+                "Id": f"rId{next_id}",
+                "Type": "http://www.wps.cn/officeDocument/2020/cellImage",
+                "Target": "cellimages.xml",
+            },
+        )
+    )
+    entries[workbook_rels_part] = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+    entries["xl/cellimages.xml"] = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<etc:cellImages xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:etc="http://www.wps.cn/officeDocument/2017/etCustomData">
+  <etc:cellImage>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="1" name="{image_id}"/>
+        <xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr>
+      </xdr:nvPicPr>
+      <xdr:blipFill>
+        <a:blip r:embed="rId1"/>
+        <a:stretch><a:fillRect/></a:stretch>
+      </xdr:blipFill>
+      <xdr:spPr>
+        <a:xfrm><a:off x="0" y="0"/><a:ext cx="11430000" cy="3810000"/></a:xfrm>
+        <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+      </xdr:spPr>
+    </xdr:pic>
+  </etc:cellImage>
+</etc:cellImages>
+""".encode("utf-8")
+    entries["xl/_rels/cellimages.xml.rels"] = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>
+"""
+    entries["xl/media/image1.png"] = image_path.read_bytes()
+    for name, data in list(entries.items()):
+        if not name.startswith("xl/worksheets/sheet") or not name.endswith(".xml"):
+            continue
+        root = ET.fromstring(data)
+        changed = False
+        for cell in root.findall(f".//{{{sheet_ns}}}c"):
+            formula = cell.find(f"{{{sheet_ns}}}f")
+            if formula is None or not formula.text or "DISPIMG" not in formula.text:
+                continue
+            value = cell.find(f"{{{sheet_ns}}}v")
+            if value is None:
+                value = ET.SubElement(cell, f"{{{sheet_ns}}}v")
+            value.text = f"={formula.text}"
+            changed = True
+        if changed:
+            entries[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    temp_path = path.with_suffix(".tmp.xlsx")
+    with ZipFile(temp_path, "w") as target:
+        for name, data in entries.items():
+            target.writestr(name, data)
+    temp_path.replace(path)
+
+
 def write_template_workbook(path: Path, embedded_image: Path | None = None, poster_value: str = "poster.png") -> None:
     wb = Workbook()
     ws = wb.active
@@ -94,6 +173,7 @@ def write_template_workbook(path: Path, embedded_image: Path | None = None, post
             "活动宣发素材图",
             "生成状态",
             "跳过原因",
+            "备注",
             "生成时间",
             "回链",
             "截图",
@@ -134,6 +214,28 @@ def write_multi_activity_template_workbook(path: Path) -> None:
 
     ws = wb.create_sheet("宣发及回链内容")
     ws.append(["代理UID", "代理邀请码", "语言", "地区", "使用域名", "所属BD", "活动宣发内容", "活动宣发素材图"])
+    wb.save(path)
+
+
+def write_language_pack_template_workbook(path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "KOL状态 最新状态"
+    ws.append(["代理UID", "代理邀请码", "代理备注", "代理层级", "语言", "地区", "域名", "所属BD", "BD申请状态", "投放复核状态"])
+    ws.append(["TEST_UID_EN", "EN123", "English KOL", "总代理", "EN", "PHP", "LBank.com", "BD_TEST", "申请", "通过"])
+    ws.append(["TEST_UID_TR", "TR456", "Turkish KOL", "总代理", "TR", "TR", "LBank.com", "BD_TEST", "申请", "通过"])
+
+    ws = wb.create_sheet("本期活动内容")
+    ws.append(["标题", "正文", "链接", "配图"])
+    ws.append(["Wrong Legacy Title", "Wrong legacy body", "https://www.lbank.com/event-new/99999999-wrong", ""])
+
+    ws = wb.create_sheet("宣发及回链内容")
+    ws.append(["代理UID", "代理邀请码", "语言", "地区", "域名", "所属BD", "活动宣发内容", "活动宣发素材图", "回链", "截图", "付款金额", "付款时间", "付款人"])
+
+    ws = wb.create_sheet("活动1")
+    ws.append(["语言", "标题", "正文", "链接", "配图"])
+    ws.append(["EN", "English Activity", "English body", "https://www.lbank.com/event-new/10001812-0fee-stocks", ""])
+    ws.append(["CN", "繁中活動", "繁中正文", "https://www.lbank.com/zh-TC/event-new/10001812-0fee-stocks", ""])
     wb.save(path)
 
 
@@ -326,6 +428,7 @@ Step 2: Register the event
             self.assertIn("生成宣发文案", headers)
             self.assertIn("生成状态", headers)
             self.assertIn("跳过原因", headers)
+            self.assertIn("备注", headers)
             self.assertEqual(ws.max_row, 5)
             output_wb.close()
 
@@ -376,14 +479,19 @@ Step 2: Register the event
             self.assertEqual(row2["活动链接"], "https://www.lbank.com/event-new/10001753-wojak-sausage?icode=ABC123")
             self.assertIn("Activity 5 10,000 USDT", row2["活动宣发内容"])
             self.assertIn("https://www.lbank.com/event-new/10001753-wojak-sausage?icode=ABC123", row2["活动宣发内容"])
-            self.assertIn("https://LBank.com/ref/ABC123", row2["活动宣发内容"])
+            self.assertNotIn("https://LBank.com/ref/ABC123", row2["活动宣发内容"])
+            self.assertNotIn("Step 1", row2["活动宣发内容"])
+            self.assertNotIn("步骤1", row2["活动宣发内容"])
+            self.assertNotIn("步驟1", row2["活动宣发内容"])
             self.assertEqual(row2["活动宣发素材图"], "poster.png")
             self.assertEqual(row2["生成状态"], "已生成")
+            self.assertIn(row2["备注"], (None, ""))
             self.assertIsNotNone(row2["生成时间"])
 
             self.assertEqual(row3["代理UID"], "TEST_UID_002")
             self.assertEqual(row3["生成状态"], "已跳过")
             self.assertEqual(row3["跳过原因"], "投放复核未通过")
+            self.assertIn(row3["备注"], (None, ""))
             wb.close()
 
     def test_run_generation_writes_one_output_sheet_per_activity(self):
@@ -421,6 +529,45 @@ Step 2: Register the event
             self.assertEqual(ws2.cell(row=3, column=headers2.index("生成状态") + 1).value, "已跳过")
             wb.close()
 
+    def test_run_generation_prefers_activity_sheet_language_pack_with_en_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workbook_path = tmp / "template.xlsx"
+            output_root = tmp / "output"
+            write_language_pack_template_workbook(workbook_path)
+
+            self.assertTrue(is_template_workbook(workbook_path))
+            summary = run_generation(workbook_path, output_root=output_root)
+
+            self.assertEqual(summary["mode"], "activity_sheet_template")
+            self.assertEqual(summary["activity_text"], "活动1")
+            self.assertEqual(summary["activity_count"], 1)
+            self.assertEqual(summary["generated_count"], 2)
+            self.assertEqual(summary["skipped_count"], 0)
+            self.assertEqual(summary["fallback_count"], 1)
+            self.assertEqual(summary["fallback_rows"][0]["原语言"], "TR")
+            self.assertEqual(summary["fallback_rows"][0]["兜底语言"], "EN")
+
+            wb = load_workbook(output_root / "test1" / "filled_template.xlsx", data_only=True)
+            ws = wb["宣发及回链内容"]
+            headers = [cell.value for cell in ws[1]]
+            row_en = {headers[index]: ws.cell(row=2, column=index + 1).value for index in range(len(headers))}
+            row_tr = {headers[index]: ws.cell(row=3, column=index + 1).value for index in range(len(headers))}
+
+            self.assertIn("English Activity", row_en["活动宣发内容"])
+            self.assertIn("English Activity", row_tr["活动宣发内容"])
+            self.assertNotIn("Wrong Legacy Title", row_en["活动宣发内容"])
+            self.assertNotIn("Wrong Legacy Title", row_tr["活动宣发内容"])
+            self.assertIn("10001812-0fee-stocks?icode=TR456", row_tr["活动链接"])
+            self.assertIn("10001812-0fee-stocks?icode=TR456", row_tr["活动宣发内容"])
+            self.assertNotIn("https://LBank.com/ref/TR456", row_tr["活动宣发内容"])
+            self.assertNotIn("Step 1", row_tr["活动宣发内容"])
+            self.assertNotIn("步骤1", row_tr["活动宣发内容"])
+            self.assertNotIn("步驟1", row_tr["活动宣发内容"])
+            self.assertIn(row_en["备注"], (None, ""))
+            self.assertEqual(row_tr["备注"], "语言 TR 未提供，已使用 EN 英文兜底")
+            wb.close()
+
     def test_run_generation_saves_embedded_activity_image_as_asset_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -440,6 +587,36 @@ Step 2: Register the event
             asset_path = ws.cell(row=2, column=image_col + 1).value
             self.assertEqual(len(ws._images), 0)
             self.assertEqual(asset_path, "assets/activity_1_image_1.png")
+            self.assertTrue((output_root / "test1" / asset_path).exists())
+            wb.close()
+
+    def test_run_generation_saves_wps_dispimg_cell_image_as_asset_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workbook_path = tmp / "template.xlsx"
+            output_root = tmp / "output"
+            image_path = tmp / "poster.png"
+            write_test_png(image_path)
+            write_language_pack_template_workbook(workbook_path)
+
+            wb = load_workbook(workbook_path)
+            ws = wb["活动1"]
+            ws["E2"] = '=DISPIMG("ID_TEST_IMAGE",1)'
+            wb.save(workbook_path)
+            wb.close()
+            add_wps_cell_image(workbook_path, image_path)
+
+            run_generation(workbook_path, output_root=output_root)
+
+            wb = load_workbook(output_root / "test1" / "filled_template.xlsx", data_only=True)
+            ws = wb["宣发及回链内容"]
+            headers = [cell.value for cell in ws[1]]
+            image_col = headers.index("活动宣发素材图")
+
+            asset_path = ws.cell(row=2, column=image_col + 1).value
+            fallback_asset_path = ws.cell(row=3, column=image_col + 1).value
+            self.assertEqual(asset_path, "assets/activity_1_row_2_image_1.png")
+            self.assertEqual(fallback_asset_path, "assets/activity_1_row_2_image_1.png")
             self.assertTrue((output_root / "test1" / asset_path).exists())
             wb.close()
 
